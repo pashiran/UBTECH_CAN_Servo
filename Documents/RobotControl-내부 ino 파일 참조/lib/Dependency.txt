@@ -1,0 +1,5 @@
+Already included in lib_deps of platformio.txt:
+
+OLED12864=https://github.com/Super169/OLED12864/archive/RobotControl_2.0.zip
+
+
