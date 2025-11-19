@@ -25,7 +25,7 @@
 
 ### 1.2 회로 구성도
 
-![Serial-2_to_1 회로 구성도](pics/Serial-2_to_1.png)
+![Serial-2_to_1 회로 구성도](Tech_Docs_Collection/CAN_Servo_Protocol_Documents/Serial-2_to_1.png)
 
 ### 1.3 배선 가이드
 
