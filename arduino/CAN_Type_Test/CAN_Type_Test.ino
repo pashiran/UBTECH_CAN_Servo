@@ -31,6 +31,8 @@ MCP_CAN CAN(CAN_CS_PIN);
 // 전역 변수
 // ============================================
 byte lastFoundServoID = 0;  // 마지막으로 발견된 서보 ID (0=없음)
+byte foundServoIDs[240];    // 발견된 서보 ID 목록
+int foundServoCount = 0;    // 발견된 서보 개수
 
 // ============================================
 // 함수 선언 (프로토콜 명령어 기반)
@@ -122,6 +124,13 @@ void setup() {
   
   sendServoDiscovery();
   
+  printMenu();
+}
+
+// ============================================
+// 메뉴 출력 함수
+// ============================================
+void printMenu() {
   Serial.println(F("\nMenu:"));
   Serial.println(F("  1: Search"));
   Serial.println(F("  2: Test TX"));
@@ -132,6 +141,7 @@ void setup() {
   Serial.println(F("  7: Rotate Demo"));
   Serial.println(F("  8: Read Info"));
   Serial.println(F("  9: Change ID"));
+  Serial.println(F("  D: Debug IDs 2-6"));
   Serial.println(F("  L: Lock Servo"));
   Serial.println(F("  U: Unlock Servo"));
   Serial.println();
@@ -142,86 +152,112 @@ void setup() {
 // 서보 검색 함수
 // ============================================
 void sendServoDiscovery() {
-  // 16바이트 논리 패킷을 2개의 8바이트 CAN 프레임으로 분할
-  // 전체: AA 00 00 01 00 00 00 [ID] | 01 00 00 00 00 00 00 00
-  //       [------Frame 1------] | [------Frame 2------]
+  // 근본적 해결책: 개별 ID 쿼리 방식
+  // - 브로드캐스트 대신 ID 1~240을 순차 쿼리
+  // - 한 번에 1개 서보만 응답 → MCP2515 버퍼 오버플로우 방지
+  // - 모든 서보를 확실하게 탐지
   
-  byte frame1[8] = {0xAA, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};  // 바이트 0-7: ID=0 (브로드캐스트)
-  byte frame2[8] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // 바이트 8-15: CMD=0x01
-  
-  Serial.println(F("    TX Packet:"));
-  Serial.println(F("    AA 00 00 01 00 00 00 00 01 00 00 00 00 00 00 00"));
-  Serial.println(F("    [--Header--] [--ID=0--] [CMD=01] [---Params---]"));
+  Serial.println(F("    Scanning IDs 1~240 individually..."));
+  Serial.println(F("    (Avoids MCP2515 RX buffer overflow)"));
   Serial.println();
-  Serial.flush();
   
-  CAN.sendMsgBuf(0x00, 0, 8, frame1);
-  delay(10);
-  CAN.sendMsgBuf(0x00, 0, 8, frame2);
-  delay(10);
+  // 발견된 서보 목록 초기화
+  foundServoCount = 0;
+  for (int i = 0; i < 240; i++) {
+    foundServoIDs[i] = 0;
+  }
   
-  Serial.println(F("\n    Wait 3 sec...\n"));
-  Serial.flush();
+  byte frame1[8] = {0xAA, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};  // ID는 나중에 설정
+  byte frame2[8] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // CMD=0x01 (정보 읽기)
   
-  unsigned long startTime = millis();
-  int responseCount = 0;
+  int scannedCount = 0;
   
-  while (millis() - startTime < 3000) {
-    if (CAN.checkReceive() == CAN_MSGAVAIL) {
-      unsigned long canId;
-      byte len = 0;
-      byte buf[8];
-      
-      CAN.readMsgBuf(&canId, &len, buf);
-      
-      responseCount++;
-      
-      // CAN ID에서 서보 ID 추출
-      byte foundServoID = extractServoIDFromCANID(canId);
-      if (foundServoID > 0) {
-        lastFoundServoID = foundServoID;  // 마지막 발견된 ID 저장
+  // ID 1~240을 순차 쿼리 (전체 범위 스캔)
+  for (byte testID = 1; testID <= 240; testID++) {
+    frame1[7] = testID;  // 대상 ID 설정
+    
+    // 명령 전송
+    CAN.sendMsgBuf(0x00, 0, 8, frame1);
+    delay(20);
+    CAN.sendMsgBuf(0x00, 0, 8, frame2);
+    
+    scannedCount++;
+    
+    // 응답 대기 (300ms)
+    unsigned long startTime = millis();
+    bool foundResponse = false;
+    
+    while (millis() - startTime < 300) {
+      if (CAN.checkReceive() == CAN_MSGAVAIL) {
+        unsigned long canId;
+        byte len = 0;
+        byte buf[8];
+        
+        CAN.readMsgBuf(&canId, &len, buf);
+        
+        // CAN ID에서 서보 ID 추출
+        byte foundServoID = extractServoIDFromCANID(canId);
+        
+        // 응답한 서보가 쿼리한 ID와 일치하는지 확인
+        if (foundServoID == testID) {
+          // 새로운 서보 발견
+          foundServoIDs[foundServoCount] = foundServoID;
+          foundServoCount++;
+          lastFoundServoID = foundServoID;
+          
+          Serial.print(F("    ["));
+          Serial.print(scannedCount);
+          Serial.print(F("/240] Found Servo ID "));
+          Serial.print(foundServoID);
+          
+          // 위치 정보 파싱 (타입 B: 단일 8바이트 프레임)
+          if (len >= 3 && buf[0] == 0x02) {
+            int posRaw = buf[1] | (buf[2] << 8);
+            float angle = (posRaw * 360.0) / 4096.0;
+            Serial.print(F(" @ "));
+            Serial.print(angle, 1);
+            Serial.print(F("°"));
+          }
+          Serial.println();
+          
+          foundResponse = true;
+          break;  // 응답 받았으므로 다음 ID로
+        }
       }
-      
-      Serial.print(F("    ["));
-      Serial.print(responseCount);
-      Serial.print(F("] ID=0x"));
-      Serial.print(canId, HEX);
-      Serial.print(F(" "));
-      
-      for (int i = 0; i < len; i++) {
-        if (buf[i] < 0x10) Serial.print(F("0"));
-        Serial.print(buf[i], HEX);
-        Serial.print(F(" "));
-      }
-      
-      if (len >= 8 && buf[0] == 0xAA && buf[1] == 0x00 && buf[2] == 0x00) {
-        Serial.print(F(" [ID:"));
-        Serial.print(buf[7]);
-        Serial.print(F("]"));
-      } else if (foundServoID > 0) {
-        Serial.print(F(" [Servo:"));
-        Serial.print(foundServoID);
-        Serial.print(F("]"));
-      }
-      Serial.println();
-      Serial.flush();
+      delay(1);
     }
-    delay(10);
+    
+    // 진행 상황 표시 (매 20개마다)
+    if (!foundResponse && testID % 20 == 0) {
+      Serial.print(F("    ["));
+      Serial.print(scannedCount);
+      Serial.print(F("/240] Scanning..."));
+      Serial.println();
+    }
   }
   
   Serial.println();
-  if (responseCount == 0) {
-    Serial.println(F("    ! No response"));
+  if (foundServoCount == 0) {
+    Serial.println(F("    ! No servos found"));
     Serial.println();
     Serial.println(F("    Check:"));
     Serial.println(F("      - 24V power"));
-    Serial.println(F("      - CANH/CANL"));
-    Serial.println(F("      - 120ohm"));
+    Serial.println(F("      - CANH/CANL wiring"));
+    Serial.println(F("      - 120ohm termination"));
     Serial.println(F("      - GND common"));
+    Serial.println();
+    Serial.println(F("    Or servos may have IDs > 240"));
+    Serial.println(F("    (Increase scan range if needed)"));
   } else {
-    Serial.print(F("    OK: "));
-    Serial.print(responseCount);
-    Serial.println(F(" resp"));
+    Serial.print(F("    === FOUND: "));
+    Serial.print(foundServoCount);
+    Serial.println(F(" SERVO(S) ==="));
+    Serial.print(F("    IDs: "));
+    for (int i = 0; i < foundServoCount; i++) {
+      Serial.print(foundServoIDs[i]);
+      if (i < foundServoCount - 1) Serial.print(F(", "));
+    }
+    Serial.println();
   }
   Serial.println();
   Serial.flush();
@@ -238,6 +274,7 @@ void loop() {
       case '1':
         Serial.println(F("\n>>> Search"));
         sendServoDiscovery();
+        printMenu();
         break;
         
       case '2':
@@ -247,41 +284,56 @@ void loop() {
           CAN.sendMsgBuf(0x100, 0, 8, testFrame);
           Serial.println(F("    OK"));
         }
+        printMenu();
         break;
         
       case '3':
         Serial.println(F("\n>>> Monitor 10s"));
         monitorCAN(10000);
+        printMenu();
         break;
         
       case '4':
         Serial.println(F("\n>>> Loopback"));
         testLoopback();
+        printMenu();
         break;
         
       case '5':
         Serial.println(F("\n>>> Status"));
         checkCANStatus();
+        printMenu();
         break;
         
       case '6':
         Serial.println(F("\n>>> Try 500kbps"));
         tryDifferentSpeed();
+        printMenu();
         break;
         
       case '7':
         Serial.println(F("\n>>> Rotate Demo"));
         rotateServoDemo();
+        printMenu();
         break;
         
       case '8':
         Serial.println(F("\n>>> Read Info"));
         readServoInfo();
+        printMenu();
         break;
         
       case '9':
         Serial.println(F("\n>>> Change ID"));
         changeServoID();
+        printMenu();
+        break;
+        
+      case 'd':
+      case 'D':
+        Serial.println(F("\n>>> Debug IDs 2-6"));
+        debugMissingServos();
+        printMenu();
         break;
         
       case 'l':
@@ -293,6 +345,7 @@ void loop() {
           Serial.println(F("    ! No servo found. Run 'Search' first."));
         }
         Serial.println();
+        printMenu();
         break;
         
       case 'u':
@@ -304,11 +357,13 @@ void loop() {
           Serial.println(F("    ! No servo found. Run 'Search' first."));
         }
         Serial.println();
+        printMenu();
         break;
         
       default:
         if (input >= 32 && input <= 126) {
           Serial.println(F("\n? Unknown"));
+          printMenu();
         }
         break;
     }
@@ -740,6 +795,129 @@ void changeServoID() {
   Serial.flush();
 }
 
+// ============================================
+// 디버그: ID 2-6 상세 진단
+// ============================================
+void debugMissingServos() {
+  Serial.println(F("    Testing IDs 2-6 with detailed logging"));
+  Serial.println(F("    This will help diagnose why they don't respond"));
+  Serial.println();
+  
+  byte frame1[8] = {0xAA, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+  byte frame2[8] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  
+  for (byte testID = 2; testID <= 6; testID++) {
+    Serial.println(F("    ----------------------------------------"));
+    Serial.print(F("    Testing ID: "));
+    Serial.println(testID);
+    Serial.println(F("    ----------------------------------------"));
+    
+    frame1[7] = testID;
+    
+    // 버퍼 비우기
+    while (CAN.checkReceive() == CAN_MSGAVAIL) {
+      unsigned long dummyId;
+      byte dummyLen;
+      byte dummyBuf[8];
+      CAN.readMsgBuf(&dummyId, &dummyLen, dummyBuf);
+    }
+    
+    // 프레임 1 전송
+    Serial.print(F("    TX Frame1: "));
+    for (int i = 0; i < 8; i++) {
+      if (frame1[i] < 0x10) Serial.print(F("0"));
+      Serial.print(frame1[i], HEX);
+      Serial.print(F(" "));
+    }
+    Serial.println();
+    
+    byte result1 = CAN.sendMsgBuf(0x00, 0, 8, frame1);
+    if (result1 != CAN_OK) {
+      Serial.print(F("    ! TX1 FAILED: "));
+      Serial.println(result1);
+    }
+    delay(20);
+    
+    // 프레임 2 전송
+    Serial.print(F("    TX Frame2: "));
+    for (int i = 0; i < 8; i++) {
+      if (frame2[i] < 0x10) Serial.print(F("0"));
+      Serial.print(frame2[i], HEX);
+      Serial.print(F(" "));
+    }
+    Serial.println();
+    
+    byte result2 = CAN.sendMsgBuf(0x00, 0, 8, frame2);
+    if (result2 != CAN_OK) {
+      Serial.print(F("    ! TX2 FAILED: "));
+      Serial.println(result2);
+    }
+    
+    // 응답 대기 (500ms)
+    Serial.println(F("    Waiting for response (500ms)..."));
+    unsigned long startTime = millis();
+    bool gotResponse = false;
+    int msgCount = 0;
+    
+    while (millis() - startTime < 500) {
+      if (CAN.checkReceive() == CAN_MSGAVAIL) {
+        unsigned long canId;
+        byte len = 0;
+        byte buf[8];
+        
+        CAN.readMsgBuf(&canId, &len, buf);
+        msgCount++;
+        gotResponse = true;
+        
+        Serial.print(F("    RX["));
+        Serial.print(msgCount);
+        Serial.print(F("]: CAN_ID=0x"));
+        if (canId < 0x100) Serial.print(F("0"));
+        if (canId < 0x10) Serial.print(F("0"));
+        Serial.print(canId, HEX);
+        Serial.print(F(" LEN="));
+        Serial.print(len);
+        Serial.print(F(" DATA: "));
+        
+        for (int i = 0; i < len; i++) {
+          if (buf[i] < 0x10) Serial.print(F("0"));
+          Serial.print(buf[i], HEX);
+          Serial.print(F(" "));
+        }
+        
+        byte respondedID = extractServoIDFromCANID(canId);
+        Serial.print(F(" [Servo ID: "));
+        Serial.print(respondedID);
+        Serial.println(F("]"));
+        
+        if (respondedID == testID) {
+          Serial.println(F("    *** MATCH! This servo responded! ***"));
+        }
+      }
+      delay(1);
+    }
+    
+    if (!gotResponse) {
+      Serial.println(F("    *** NO RESPONSE ***"));
+      Serial.println(F("    Possible causes:"));
+      Serial.println(F("      - Motor not powered"));
+      Serial.println(F("      - Wrong ID (not actually ID 2-6)"));
+      Serial.println(F("      - CAN bus disconnected"));
+      Serial.println(F("      - Motor firmware issue"));
+    } else {
+      Serial.print(F("    Total messages received: "));
+      Serial.println(msgCount);
+    }
+    
+    Serial.println();
+    delay(200);
+  }
+  
+  Serial.println(F("    ========================================"));
+  Serial.println(F("    Debug complete"));
+  Serial.println(F("    ========================================"));
+  Serial.println();
+}
 
 void tryDifferentSpeed() {
   Serial.println(F("    Reinit to 500 kbps..."));
