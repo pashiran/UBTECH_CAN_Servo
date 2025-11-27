@@ -1,0 +1,22 @@
+name: Arduino INO File Changes
+
+on:
+  push:
+    paths:
+      - '**/*.ino'
+  pull_request:
+    paths:
+      - '**/*.ino'
+
+jobs:
+  detect-ino-changes:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: List changed INO files
+        run: |
+          echo "INO files have been modified in this commit/PR"
+          find . -name "*.ino" -type f | head -50
